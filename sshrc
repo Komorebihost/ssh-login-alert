@@ -1,4 +1,6 @@
-#!/bin/bash
+#!/bin/sh
+# sshd executes sshrc via /bin/sh — re-exec with bash if needed
+[ -z "$BASH_VERSION" ] && exec bash "$0" "$@"
 # =============================================================================
 #  SSH Login Notifier — minimal version
 #  Location : /etc/ssh/sshrc

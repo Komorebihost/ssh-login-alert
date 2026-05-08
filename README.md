@@ -133,6 +133,17 @@ sudo mail -u root
 
 ## Updating
 
+### With git
+
+```bash
+git pull origin main
+sudo bash install.sh    # or --full
+```
+
+The installer backs up the current `/etc/ssh/sshrc` before overwriting it.
+
+### Manual
+
 1. Download the new `sshrc` or `sshrc-full` from the repo.
 2. Re-apply your customisations (`RECIPIENTS`, `WHITELIST_IPS`, thresholds).
 3. Replace the installed script:
@@ -241,6 +252,14 @@ sudo rm /var/log/ssh_notify.log        # optional
 ## How it works
 
 OpenSSH executes `/etc/ssh/sshrc` automatically for every successful login, before handing control to the user's shell. The script runs entirely in the background (`&` + `disown`) so it never delays the session.
+
+**Note on shell compatibility:** sshd always runs `sshrc` via `/bin/sh`, ignoring the shebang. On systems where `/bin/sh` is not bash (e.g. Debian with `dash`), bash-specific syntax like arrays would fail. Both scripts handle this with a re-exec guard at the top:
+
+```sh
+[ -z "$BASH_VERSION" ] && exec bash "$0" "$@"
+```
+
+This transparently re-invokes the script under bash whenever `/bin/sh` is not bash.
 
 Brute-force detection queries `journalctl` (systemd) or `/var/log/auth.log` (fallback) for `Failed` entries matching the source IP in the last 60 minutes.
 
