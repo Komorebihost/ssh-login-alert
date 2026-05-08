@@ -133,7 +133,7 @@ sudo mail -u root
 
 ## Updating
 
-### With git
+### With git (if you cloned the repo)
 
 ```bash
 git pull origin main
@@ -142,16 +142,23 @@ sudo bash install.sh    # or --full
 
 The installer backs up the current `/etc/ssh/sshrc` before overwriting it.
 
-### Manual
-
-1. Download the new `sshrc` or `sshrc-full` from the repo.
-2. Re-apply your customisations (`RECIPIENTS`, `WHITELIST_IPS`, thresholds).
-3. Replace the installed script:
+### Manual (minimal version)
 
 ```bash
-sudo cp sshrc /etc/ssh/sshrc
+sudo curl -fsSL https://raw.githubusercontent.com/Komorebihost/ssh-login-alert/main/sshrc \
+    -o /etc/ssh/sshrc
 sudo chmod +x /etc/ssh/sshrc
 ```
+
+### Manual (full version)
+
+```bash
+sudo curl -fsSL https://raw.githubusercontent.com/Komorebihost/ssh-login-alert/main/sshrc-full \
+    -o /etc/ssh/sshrc
+sudo chmod +x /etc/ssh/sshrc
+```
+
+> **Remember:** re-apply your customisations (`RECIPIENTS`, `WHITELIST_IPS`, thresholds) after each update.
 
 No sshd restart needed.
 
