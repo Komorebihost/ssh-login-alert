@@ -1,0 +1,112 @@
+#!/bin/bash
+# =============================================================================
+#  SSH Login Notifier — minimal version
+#  Location : /etc/ssh/sshrc
+#  Install  : chmod +x /etc/ssh/sshrc  (no sshd restart required)
+#
+#  Sends a plain-text email on every successful SSH login not in the whitelist.
+#  Writes to the log file ONLY when the login is preceded by failed attempts
+#  from the same IP (confirmed brute-force pattern).
+#
+#  DISCLAIMER:
+#  This script is provided "as is", without warranty of any kind.
+#  It is intended as a best-effort security notification tool and should NOT
+#  be relied upon as the sole means of detecting or preventing unauthorised
+#  access. Always combine with proper firewall rules, key-based authentication,
+#  and intrusion detection/prevention systems (e.g. fail2ban).
+#  The author(s) accept no liability for missed notifications, false positives,
+#  or any security incidents arising from the use of this script.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# Add one or more recipients.
+# Example: RECIPIENTS=("you@gmail.com" "alerts@example.com")
+# ---------------------------------------------------------------------------
+RECIPIENTS=("root")
+
+LOG_FILE="/var/log/ssh_notify.log"
+FAILED_THRESHOLD=3          # Failed attempts in the last hour to flag as malicious
+
+WHITELIST_IPS=(
+    "127.0.0.1"
+    "::1"
+    # "1.2.3.4"   # e.g. office static IP
+)
+
+# ---------------------------------------------------------------------------
+
+parse_ip() {
+    echo "${SSH_CONNECTION}" | awk '{print $1}'
+}
+
+is_whitelisted() {
+    local ip="$1"
+    for trusted in "${WHITELIST_IPS[@]}"; do
+        [ "$ip" = "$trusted" ] && return 0
+    done
+    return 1
+}
+
+failed_attempts() {
+    local ip="$1"
+    local count=0
+    if command -v journalctl &>/dev/null; then
+        count=$(journalctl -u ssh -u sshd --since "1 hour ago" 2>/dev/null \
+            | grep -c "Failed.*${ip}" 2>/dev/null || true)
+    elif [ -f /var/log/auth.log ]; then
+        count=$(grep "Failed.*${ip}" /var/log/auth.log 2>/dev/null | wc -l || true)
+    fi
+    echo "${count:-0}"
+}
+
+send_alert() {
+    local ip="$1" attempts="$2"
+    local user="${USER:-$(id -un 2>/dev/null)}"
+    local now subject body
+    now=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    subject="[SSH] Login on $(hostname) — ${user}@${ip}"
+    body="SSH login detected
+
+Host    : $(hostname -f)
+User    : ${user}
+IP      : ${ip}
+Date    : ${now}"
+
+    [ "${attempts}" -ge "${FAILED_THRESHOLD}" ] && body="${body}
+
+WARNING: ${attempts} failed attempt(s) in the last 60 min
+before this successful login — possible brute-force."
+
+    printf '%s' "$body" | timeout 10 mail -s "$subject" "${RECIPIENTS[@]}" 2>/dev/null
+}
+
+log_malicious() {
+    local ip="$1" attempts="$2"
+    local user="${USER:-$(id -un 2>/dev/null)}"
+    printf '[%s] MALICIOUS user=%s ip=%s failed_attempts=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$user" "$ip" "$attempts" \
+        >> "$LOG_FILE" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    {
+        local ip attempts
+        ip=$(parse_ip)
+        ip="${ip:-unknown}"
+
+        is_whitelisted "$ip" && exit 0
+
+        attempts=$(failed_attempts "$ip")
+        send_alert "$ip" "$attempts"
+
+        [ "${attempts}" -ge "${FAILED_THRESHOLD}" ] && log_malicious "$ip" "$attempts"
+
+    } &>/dev/null &
+
+    disown 2>/dev/null || true
+}
+
+main

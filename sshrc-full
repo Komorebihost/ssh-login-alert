@@ -1,0 +1,258 @@
+#!/bin/bash
+# =============================================================================
+#  SSH Login Notifier — full version
+#  Location : /etc/ssh/sshrc
+#  Install  : chmod +x /etc/ssh/sshrc  (no sshd restart required)
+#
+#  Sends an HTML email on every successful SSH login not in the whitelist.
+#  Additional features over the minimal version:
+#    - HTML email with professional layout and colour-coded SSH port badge
+#    - IP geolocation via ip-api.com (free, no API key required)
+#    - Per-IP rate limiting to suppress duplicate alerts on rapid logins
+#    - Structured log with automatic rotation (no logrotate dependency)
+#    - Brute-force warning block inline in the HTML email
+#
+#  DISCLAIMER:
+#  This script is provided "as is", without warranty of any kind.
+#  It is intended as a best-effort security notification tool and should NOT
+#  be relied upon as the sole means of detecting or preventing unauthorised
+#  access. Always combine with proper firewall rules, key-based authentication,
+#  and intrusion detection/prevention systems (e.g. fail2ban).
+#  Geolocation data is sourced from ip-api.com and may be inaccurate or
+#  unavailable. No data is stored or shared beyond what ip-api.com logs
+#  for their free tier (see https://ip-api.com/docs/legal).
+#  The author(s) accept no liability for missed notifications, false positives,
+#  or any security incidents arising from the use of this script.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# Add one or more recipients.
+# Example: RECIPIENTS=("you@gmail.com" "alerts@example.com")
+# ---------------------------------------------------------------------------
+RECIPIENTS=("root")
+
+LOG_FILE="/var/log/ssh_notify.log"
+LOCK_DIR="/tmp/.ssh_notify_locks"
+FAILED_THRESHOLD=3
+RATE_LIMIT_SECONDS=60
+GEO_LOOKUP=true
+GEO_TIMEOUT=3
+MAIL_TIMEOUT=10
+MAX_LOG_LINES=10000
+
+WHITELIST_IPS=(
+    "127.0.0.1"
+    "::1"
+    # "1.2.3.4"   # e.g. office static IP
+)
+
+# ---------------------------------------------------------------------------
+# UTILITY
+# ---------------------------------------------------------------------------
+
+log() {
+    local level="$1"; shift
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" \
+        >> "$LOG_FILE" 2>/dev/null
+}
+
+rotate_log() {
+    if [ -f "$LOG_FILE" ]; then
+        local lines
+        lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$lines" -gt "$MAX_LOG_LINES" ]; then
+            tail -n "$((MAX_LOG_LINES / 2))" "$LOG_FILE" > "${LOG_FILE}.tmp" \
+                && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        fi
+    fi
+}
+
+parse_ssh_connection() {
+    SSH_CLIENT_IP=""; SSH_CLIENT_PORT=""; SSH_SERVER_IP=""; SSH_SERVER_PORT=""
+    if [ -n "$SSH_CONNECTION" ]; then
+        read -r SSH_CLIENT_IP SSH_CLIENT_PORT SSH_SERVER_IP SSH_SERVER_PORT \
+            <<< "$SSH_CONNECTION"
+    fi
+    SSH_CLIENT_IP="${SSH_CLIENT_IP:-unknown}"
+    SSH_CLIENT_PORT="${SSH_CLIENT_PORT:-?}"
+    SSH_SERVER_PORT="${SSH_SERVER_PORT:-22}"
+}
+
+is_whitelisted() {
+    local ip="$1"
+    for trusted in "${WHITELIST_IPS[@]}"; do
+        [ "$ip" = "$trusted" ] && return 0
+    done
+    return 1
+}
+
+check_rate_limit() {
+    local ip="$1"
+    local safe_ip
+    safe_ip=$(printf '%s' "$ip" | tr -cd '[:alnum:]._-')
+    local lock_file="${LOCK_DIR}/${safe_ip}"
+    mkdir -p "$LOCK_DIR" 2>/dev/null
+    chmod 700 "$LOCK_DIR" 2>/dev/null
+    if [ -f "$lock_file" ]; then
+        local last now diff
+        last=$(cat "$lock_file" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        diff=$(( now - last ))
+        if [ "$diff" -lt "$RATE_LIMIT_SECONDS" ]; then
+            log "INFO" "Rate limit active for $ip (last alert ${diff}s ago)"
+            return 1
+        fi
+    fi
+    date +%s > "$lock_file" 2>/dev/null
+    return 0
+}
+
+failed_attempts() {
+    local ip="$1"
+    local count=0
+    if command -v journalctl &>/dev/null; then
+        count=$(journalctl -u ssh -u sshd --since "1 hour ago" 2>/dev/null \
+            | grep -c "Failed.*${ip}" 2>/dev/null || true)
+    elif [ -f /var/log/auth.log ]; then
+        count=$(grep "Failed.*${ip}" /var/log/auth.log 2>/dev/null | wc -l || true)
+    fi
+    echo "${count:-0}"
+}
+
+get_geo_info() {
+    local ip="$1"
+    case "$ip" in
+        10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|127.*|::1)
+            echo "Local / private network"; return ;;
+    esac
+    if [ "$GEO_LOOKUP" = true ] && command -v curl &>/dev/null; then
+        local response city region country isp
+        response=$(curl -s --max-time "$GEO_TIMEOUT" \
+            "http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp" \
+            2>/dev/null)
+        if echo "$response" | grep -q '"status":"success"'; then
+            city=$(echo "$response"    | grep -oP '"city":"\K[^"]+')
+            region=$(echo "$response"  | grep -oP '"regionName":"\K[^"]+')
+            country=$(echo "$response" | grep -oP '"country":"\K[^"]+')
+            isp=$(echo "$response"     | grep -oP '"isp":"\K[^"]+')
+            echo "${city}, ${region}, ${country} (${isp})"
+            return
+        fi
+    fi
+    echo "N/A"
+}
+
+# ---------------------------------------------------------------------------
+# HTML EMAIL
+# ---------------------------------------------------------------------------
+
+build_email_html() {
+    local user="$1" ip="$2" port_client="$3" port_server="$4"
+    local geo="$5" login_time="$6" hostname="$7" attempts="$8"
+    local port_color="#27ae60"
+    [ "$port_server" != "22" ] && port_color="#f39c12"
+    local alert_block=""
+    if [ "${attempts:-0}" -ge "$FAILED_THRESHOLD" ]; then
+        alert_block='<div class="warn">&#9888;&nbsp; '"${attempts}"' failed attempt(s) in the last hour before this successful login &mdash; possible brute-force.</div>'
+    fi
+    cat <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  body{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f9;margin:0;padding:20px;color:#2c3e50}
+  .container{max-width:560px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.1)}
+  .header{background:#1a252f;color:#fff;padding:24px 28px}
+  .header h2{margin:0;font-size:20px}
+  .header .sub{margin:4px 0 0;opacity:.7;font-size:13px}
+  .bar{background:#e74c3c;color:#fff;padding:10px 28px;font-size:13px;font-weight:600}
+  .body{padding:24px 28px}
+  table{width:100%;border-collapse:collapse}
+  td{padding:9px 6px;border-bottom:1px solid #ecf0f1;font-size:14px}
+  td:first-child{color:#7f8c8d;width:38%;font-weight:600;white-space:nowrap}
+  .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:700;color:#fff;background:${port_color}}
+  .mono{font-family:'Courier New',monospace}
+  .warn{margin-top:16px;padding:12px 16px;background:#fdf3cd;border-left:4px solid #f39c12;border-radius:4px;font-size:13px;color:#7d5a00}
+  .footer{background:#f4f6f9;padding:14px 28px;font-size:12px;color:#95a5a6;border-top:1px solid #ecf0f1}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h2>&#128274; SSH Login Detected</h2>
+    <div class="sub">${hostname}</div>
+  </div>
+  <div class="bar">SSH Access &bull; $(date '+%A, %d %B %Y')</div>
+  <div class="body">
+    <table>
+      <tr><td>&#128100; User</td>        <td class="mono"><strong>${user}</strong></td></tr>
+      <tr><td>&#128205; Source IP</td>   <td class="mono">${ip}:${port_client}</td></tr>
+      <tr><td>&#127758; Location</td>    <td>${geo}</td></tr>
+      <tr><td>&#128336; Date / Time</td> <td>${login_time}</td></tr>
+      <tr><td>&#128421; Server</td>      <td class="mono">${hostname}</td></tr>
+      <tr><td>&#128279; SSH Port</td>    <td><span class="badge">${port_server}</span></td></tr>
+    </table>
+    ${alert_block}
+  </div>
+  <div class="footer">
+    Automated notification from <strong>ssh-login-alert</strong> on ${hostname}.
+    If you do not recognise this login, take action immediately.
+  </div>
+</div>
+</body>
+</html>
+EOF
+}
+
+send_email() {
+    local subject="$1" html_body="$2"
+    printf '%s' "$html_body" | timeout "$MAIL_TIMEOUT" \
+        mail -a "Content-Type: text/html; charset=UTF-8" \
+             -s "$subject" "${RECIPIENTS[@]}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+main() {
+    {
+        rotate_log
+        parse_ssh_connection
+
+        local ip="$SSH_CLIENT_IP"
+
+        is_whitelisted "$ip" && exit 0
+        check_rate_limit "$ip" || exit 0
+
+        local attempts geo login_time user hostname_full
+        attempts=$(failed_attempts "$ip")
+        geo=$(get_geo_info "$ip")
+        login_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+        user="${USER:-$(id -un 2>/dev/null)}"
+        hostname_full="$(hostname -f 2>/dev/null || hostname)"
+
+        local subject="[SSH] Login on ${hostname_full} — ${user}@${ip}"
+        local html
+        html=$(build_email_html \
+            "$user" "$ip" "$SSH_CLIENT_PORT" "$SSH_SERVER_PORT" \
+            "$geo" "$login_time" "$hostname_full" "$attempts")
+
+        if send_email "$subject" "$html"; then
+            log "INFO" "Alert sent to ${RECIPIENTS[*]}: user=${user} ip=${ip} geo=${geo} attempts=${attempts}"
+        else
+            log "ERROR" "Alert failed to ${RECIPIENTS[*]}: user=${user} ip=${ip}"
+        fi
+
+        if [ "${attempts}" -ge "${FAILED_THRESHOLD}" ]; then
+            log "MALICIOUS" "user=${user} ip=${ip} failed_attempts=${attempts} geo=${geo}"
+        fi
+
+    } &>/dev/null &
+
+    disown 2>/dev/null || true
+}
+
+main
